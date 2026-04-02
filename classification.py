@@ -103,15 +103,19 @@ def load_county_data(conn, table_name: str) -> pd.DataFrame:
 
     # FIPS needs to be a 5-digit string for the USA county map
     if "fips" in df.columns:
-        df["fips"] = (
-            pd.to_numeric(df["fips"], errors="coerce")
-            .fillna(0)
+        fips_num = pd.to_numeric(df["fips"], errors="coerce")
+
+        df["fips"] = None
+        valid_mask = fips_num.notna()
+
+        df.loc[valid_mask, "fips"] = (
+            fips_num.loc[valid_mask]
             .astype(int)
             .astype(str)
             .str.zfill(5)
         )
     else:
-        df["fips"] = "00000"
+        df["fips"] = None
 
     return df
 

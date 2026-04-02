@@ -1,4 +1,5 @@
 import json
+import ssl
 import urllib.request
 
 import plotly.express as px
@@ -16,10 +17,14 @@ def load_us_counties_geojson():
     """
     Load USA county boundary GeoJSON.
 
-    Plotly uses this file to draw county-level choropleth maps.
+    SSL verification is bypassed here because some local Python
+    environments fail certificate verification while downloading
+    the file from GitHub.
     """
     url = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
-    with urllib.request.urlopen(url) as response:
+    ssl_context = ssl._create_unverified_context()
+
+    with urllib.request.urlopen(url, context=ssl_context) as response:
         return json.load(response)
 
 
@@ -113,44 +118,48 @@ def hotspot_placeholder(conn, table_name):
         geojson = load_us_counties_geojson()
 
         map_df = results.copy()
-        risk_num_map = {"Low": 0, "Medium": 1, "High": 2}
-        map_df["risk_num"] = map_df["predicted_risk"].map(risk_num_map)
 
-        fig_map = px.choropleth(
-            map_df,
-            geojson=geojson,
-            locations="fips",
-            color="risk_num",
-            scope="usa",
-            hover_name="county",
-            hover_data={
-                "state": True,
-                "predicted_risk": True,
-                "confidence": ":.2f",
-                "avg_7day_cases": ":.1f",
-                "fips": False,
-                "risk_num": False,
-            },
-            color_continuous_scale=[
-                [0.0, "green"],
-                [0.5, "orange"],
-                [1.0, "red"],
-            ],
-            range_color=(0, 2),
-            title="County-Level Predicted Risk",
-        )
+        # Keep only rows that have a valid county FIPS code
+        map_df = map_df[map_df["fips"].notna()].copy()
+        map_df["fips"] = map_df["fips"].astype(str)
+        map_df = map_df[map_df["fips"].str.len() == 5].copy()
 
-        fig_map.update_layout(
-            margin={"r": 0, "t": 50, "l": 0, "b": 0},
-            coloraxis_colorbar=dict(
-                title="Risk",
-                tickvals=[0, 1, 2],
-                ticktext=["Low", "Medium", "High"],
-            ),
-        )
-        fig_map.update_geos(fitbounds="locations", visible=False)
+        if map_df.empty:
+            st.warning("No valid county FIPS values found for the map.")
+        else:
+            fig_map = px.choropleth(
+                map_df,
+                geojson=geojson,
+                locations="fips",
+                featureidkey="id",
+                color="predicted_risk",
+                scope="usa",
+                hover_name="county",
+                hover_data={
+                    "state": True,
+                    "confidence": ":.2f",
+                    "avg_7day_cases": ":.1f",
+                    "fips": True,
+                },
+                color_discrete_map={
+                    "Low": "green",
+                    "Medium": "orange",
+                    "High": "red",
+                },
+                title="County-Level Predicted Risk",
+            )
 
-        st.plotly_chart(fig_map, use_container_width=True)
+            fig_map.update_geos(
+                visible=False,
+                scope="usa",
+                projection_type="albers usa",
+            )
+
+            fig_map.update_layout(
+                margin={"r": 0, "t": 50, "l": 0, "b": 0}
+            )
+
+            st.plotly_chart(fig_map, use_container_width=True)
 
     except Exception as e:
         st.warning(f"Map could not be loaded: {e}")
@@ -162,7 +171,6 @@ def hotspot_placeholder(conn, table_name):
     # --------------------------------------------------------
     st.markdown("### County Details")
 
-    # We use "State — County" because county names repeat across states.
     results["display_name"] = results["state"] + " — " + results["county"]
 
     selected_display = st.selectbox(
@@ -175,7 +183,6 @@ def hotspot_placeholder(conn, table_name):
     selected_state = selected_row["state"]
     selected_county = selected_row["county"]
 
-    # Key metrics for selected county
     cc1, cc2, cc3, cc4, cc5, cc6 = st.columns(6)
     cc1.metric("Risk Level", selected_row["predicted_risk"])
     cc2.metric("Confidence", f"{selected_row['confidence']:.2f}")
@@ -191,7 +198,6 @@ def hotspot_placeholder(conn, table_name):
         f"**7-Day Growth:** {selected_row['growth_7'] * 100:.2f}%"
     )
 
-    # Historical chart for the selected county
     history = get_county_history(conn, table_name, selected_state, selected_county)
 
     if not history.empty:
@@ -217,6 +223,7 @@ def hotspot_placeholder(conn, table_name):
             color="metric",
             title=f"{selected_county}, {selected_state} — Historical Trend",
         )
+
         st.plotly_chart(fig_trend, use_container_width=True)
 
 
