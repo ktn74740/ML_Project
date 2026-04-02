@@ -2,10 +2,12 @@ import json
 import ssl
 import urllib.request
 
+import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 from classification import predict_current_hotspots, get_county_history
+from forecasting import prepare_forecast_artifacts
 
 
 # ============================================================
@@ -177,6 +179,7 @@ def hotspot_placeholder(conn, table_name):
         "Select County",
         results["display_name"].tolist(),
         index=0,
+        key="hotspot_county_select",
     )
 
     selected_row = results.loc[results["display_name"] == selected_display].iloc[0]
@@ -228,9 +231,156 @@ def hotspot_placeholder(conn, table_name):
 
 
 # ============================================================
-# PREDICTION PAGE PLACEHOLDER
+# PREDICTION PAGE
 # ============================================================
 
-def forecasting_placeholder():
+def forecasting_placeholder(conn, table_name):
+    """
+    Prediction page:
+    - choose horizon
+    - select state and county
+    - show predicted value
+    - show validation metrics
+    - plot history + forecast
+    """
     st.subheader("Forecasting")
-    st.info("Next step: county-level ML prediction page.")
+
+    # User chooses prediction horizon
+    horizon = st.radio(
+        "Select Forecast Horizon",
+        options=[1, 7, 14],
+        horizontal=True,
+        format_func=lambda x: f"{x}-Day",
+    )
+
+    # Build forecast model + latest predictions
+    model, latest_df, metrics = prepare_forecast_artifacts(conn, table_name, horizon)
+
+    if latest_df.empty or model is None:
+        st.warning("No forecast data available.")
+        return
+
+    # --------------------------------------------------------
+    # State and county selection
+    # --------------------------------------------------------
+    states = sorted(latest_df["state"].dropna().unique().tolist())
+
+    selected_state = st.selectbox(
+        "Select State",
+        states,
+        key=f"forecast_state_{horizon}",
+    )
+
+    county_options = (
+        latest_df.loc[latest_df["state"] == selected_state, "county"]
+        .dropna()
+        .sort_values()
+        .tolist()
+    )
+
+    selected_county = st.selectbox(
+        "Select County",
+        county_options,
+        key=f"forecast_county_{horizon}",
+    )
+
+    selected_row = latest_df[
+        (latest_df["state"] == selected_state) &
+        (latest_df["county"] == selected_county)
+    ].iloc[0]
+
+    forecast_value = float(selected_row["predicted_value"])
+
+    # --------------------------------------------------------
+    # Summary section
+    # --------------------------------------------------------
+    if horizon == 1:
+        forecast_label = "Next-Day Forecast"
+        forecast_desc = "Predicted new cases for the next day"
+    elif horizon == 7:
+        forecast_label = "Next 7-Day Avg Forecast"
+        forecast_desc = "Predicted average daily new cases over the next 7 days"
+    else:
+        forecast_label = "Next 14-Day Avg Forecast"
+        forecast_desc = "Predicted average daily new cases over the next 14 days"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(forecast_label, f"{forecast_value:,.1f}")
+    c2.metric("Latest New Cases", f"{float(selected_row['new_cases']):,.0f}")
+    c3.metric("Current 7-Day Avg", f"{float(selected_row['avg_7day_cases']):,.1f}")
+    c4.metric("7-Day Growth", f"{float(selected_row['growth_7']) * 100:,.2f}%")
+
+    if metrics is not None:
+        st.caption(
+            f"Model: Random Forest Regressor | "
+            f"Training rows: {metrics['training_rows']:,} | "
+            f"Validation rows: {metrics['validation_rows']:,} | "
+            f"MAE: {metrics['mae']:.2f} | "
+            f"RMSE: {metrics['rmse']:.2f} | "
+            f"R²: {metrics['r2']:.3f}"
+        )
+
+    st.info(forecast_desc)
+
+    st.markdown("---")
+
+    # --------------------------------------------------------
+    # Historical + forecast chart
+    # --------------------------------------------------------
+    history = get_county_history(conn, table_name, selected_state, selected_county)
+
+    if history.empty:
+        st.warning("No historical data found for this county.")
+        return
+
+    history_plot = history[["date", "new_cases", "ma7_new_cases"]].copy()
+    history_plot = history_plot.melt(
+        id_vars="date",
+        value_vars=["new_cases", "ma7_new_cases"],
+        var_name="metric",
+        value_name="count",
+    )
+
+    history_plot["metric"] = history_plot["metric"].replace(
+        {
+            "new_cases": "Daily New Cases",
+            "ma7_new_cases": "7-Day Moving Average",
+        }
+    )
+
+    last_date = history["date"].max()
+
+    if horizon == 1:
+        future_dates = [last_date + pd.Timedelta(days=1)]
+        future_metric_name = "Forecasted Next-Day Cases"
+    else:
+        future_dates = pd.date_range(
+            start=last_date + pd.Timedelta(days=1),
+            periods=horizon,
+            freq="D",
+        )
+        future_metric_name = f"Forecasted Daily Avg ({horizon}-Day Horizon)"
+
+    forecast_plot = pd.DataFrame({
+        "date": future_dates,
+        "metric": future_metric_name,
+        "count": forecast_value,
+    })
+
+    combined_plot = pd.concat([history_plot, forecast_plot], ignore_index=True)
+
+    fig_forecast = px.line(
+        combined_plot,
+        x="date",
+        y="count",
+        color="metric",
+        title=f"{selected_county}, {selected_state} — Forecast View",
+    )
+
+    st.plotly_chart(fig_forecast, use_container_width=True)
+
+    if horizon in [7, 14]:
+        st.caption(
+            f"For the {horizon}-day horizon, the forecast line represents the "
+            f"predicted average daily new cases during that upcoming period."
+        )

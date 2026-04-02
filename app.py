@@ -47,4 +47,4 @@ elif page == "Hotspot":
     hotspot_placeholder(conn, TABLE_NAME)
 
 elif page == "Prediction":
-    forecasting_placeholder()
+    forecasting_placeholder(conn, TABLE_NAME)

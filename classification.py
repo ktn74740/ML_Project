@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import streamlit as st
 from sklearn.ensemble import RandomForestClassifier
 
 from db import read_sql
@@ -9,8 +10,6 @@ from db import read_sql
 # CONFIG
 # ============================================================
 
-# These are the model input features we will train on.
-# They are built from recent county-level COVID activity.
 FEATURE_COLS = [
     "new_cases",
     "new_deaths",
@@ -26,7 +25,6 @@ FEATURE_COLS = [
     "acceleration",
 ]
 
-# Used later for sorting High > Medium > Low
 RISK_ORDER = {"Low": 0, "Medium": 1, "High": 2}
 
 
@@ -35,12 +33,6 @@ RISK_ORDER = {"Low": 0, "Medium": 1, "High": 2}
 # ============================================================
 
 def safe_growth(current_series, previous_series):
-    """
-    Compute percentage growth safely.
-
-    We avoid divide-by-zero problems by replacing 0 with NaN first,
-    then filling missing values back with 0.
-    """
     previous_series = previous_series.replace(0, np.nan)
     growth = (current_series - previous_series) / previous_series
     growth = growth.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -48,13 +40,6 @@ def safe_growth(current_series, previous_series):
 
 
 def future_average(series, horizon=7):
-    """
-    Build the average of the next N future values.
-
-    Example:
-    If horizon=7, then for each date we compute the average of
-    the next 7 days of new_cases.
-    """
     total = 0
     for i in range(1, horizon + 1):
         total += series.shift(-i)
@@ -62,13 +47,6 @@ def future_average(series, horizon=7):
 
 
 def label_from_future(future_avg_7, medium_threshold, high_threshold):
-    """
-    Convert future outbreak intensity into a class label.
-
-    This gives us a true supervised-learning target:
-    we use the future 7-day average to decide if a historical row
-    should be treated as Low / Medium / High risk.
-    """
     if future_avg_7 >= high_threshold:
         return "High"
     elif future_avg_7 >= medium_threshold:
@@ -80,28 +58,28 @@ def label_from_future(future_avg_7, medium_threshold, high_threshold):
 # DATA LOADING
 # ============================================================
 
-def load_county_data(conn, table_name: str) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_county_data(_conn, table_name: str) -> pd.DataFrame:
     """
-    Load county-level data from SQLite and do basic cleanup.
+    Load county-level data from SQLite and clean the key columns.
     """
     query = f"""
     SELECT date, state, county, fips, cases, deaths, new_cases, new_deaths, ma7_new_cases
     FROM {table_name}
     ORDER BY state, county, date
     """
-    df = read_sql(conn, query)
+    df = read_sql(_conn, query)
 
     if df.empty:
         return df
 
-    # Convert date and numeric columns into clean types
     df["date"] = pd.to_datetime(df["date"])
 
     numeric_cols = ["cases", "deaths", "new_cases", "new_deaths", "ma7_new_cases"]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # FIPS needs to be a 5-digit string for the USA county map
+    # Convert only valid FIPS values. Missing ones stay as None.
     if "fips" in df.columns:
         fips_num = pd.to_numeric(df["fips"], errors="coerce")
 
@@ -124,19 +102,13 @@ def load_county_data(conn, table_name: str) -> pd.DataFrame:
 # FEATURE ENGINEERING
 # ============================================================
 
-def build_training_and_latest_frames(conn, table_name: str):
+def build_training_and_latest_frames(_conn, table_name: str):
     """
-    Build two datasets:
-
-    1. train_df
-       Historical county snapshots with features + future-based label
-       Used to train the classifier.
-
-    2. latest_df
-       Most recent valid row per county
-       Used to predict today's current hotspot risk.
+    Build:
+    1. train_df  -> historical county snapshots used for training
+    2. latest_df -> most recent valid row per county for current prediction
     """
-    df = load_county_data(conn, table_name)
+    df = load_county_data(_conn, table_name)
 
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -147,12 +119,10 @@ def build_training_and_latest_frames(conn, table_name: str):
     for (state, county), group_df in df.groupby(["state", "county"], sort=False):
         group_df = group_df.sort_values("date").reset_index(drop=True)
 
-        # We skip counties with too little history,
-        # because the rolling features and future labels need enough rows.
         if len(group_df) < 30:
             continue
 
-        # Recent case activity features
+        # Recent case features
         group_df["avg_3day_cases"] = group_df["new_cases"].rolling(3).mean()
         group_df["avg_7day_cases"] = group_df["new_cases"].rolling(7).mean()
         group_df["prev_7day_cases"] = group_df["avg_7day_cases"].shift(7)
@@ -161,34 +131,30 @@ def build_training_and_latest_frames(conn, table_name: str):
             group_df["prev_7day_cases"]
         )
 
-        # Recent death activity features
+        # Recent death features
         group_df["avg_3day_deaths"] = group_df["new_deaths"].rolling(3).mean()
         group_df["avg_7day_deaths"] = group_df["new_deaths"].rolling(7).mean()
 
-        # Volatility tells us how unstable the recent case pattern is
+        # Volatility and acceleration
         group_df["volatility_7"] = group_df["new_cases"].rolling(7).std().fillna(0)
-
-        # Acceleration tells us whether the short-term trend
-        # is rising faster than the weekly baseline
         group_df["acceleration"] = (
             group_df["avg_3day_cases"] - group_df["avg_7day_cases"]
         )
 
-        # This is the future target signal we will learn from
+        # Future target signal
         group_df["future_avg_7"] = future_average(group_df["new_cases"], horizon=7)
 
-        # Save the latest valid row for live/current prediction
+        # Latest valid row for live prediction
         latest_valid = group_df.dropna(subset=FEATURE_COLS).tail(1).copy()
         if not latest_valid.empty:
             latest_parts.append(latest_valid)
 
-        # Save historical rows for training
+        # Historical training rows
         train_valid = group_df.dropna(subset=FEATURE_COLS + ["future_avg_7"]).copy()
         if train_valid.empty:
             continue
 
-        # Sampling every 7th row keeps training faster
-        # while still giving enough historical coverage.
+        # Weekly sampling keeps training lighter
         train_valid = train_valid.iloc[::7].copy()
         training_parts.append(train_valid)
 
@@ -198,8 +164,6 @@ def build_training_and_latest_frames(conn, table_name: str):
     train_df = pd.concat(training_parts, ignore_index=True)
     latest_df = pd.concat(latest_parts, ignore_index=True)
 
-    # We derive class thresholds from the actual future case distribution.
-    # This is more data-driven than using hardcoded labels.
     positive_future = train_df.loc[train_df["future_avg_7"] > 0, "future_avg_7"]
 
     if len(positive_future) >= 10:
@@ -209,11 +173,9 @@ def build_training_and_latest_frames(conn, table_name: str):
         medium_threshold = 10.0
         high_threshold = 50.0
 
-    # Safety check in case the quantiles collapse
     if high_threshold <= medium_threshold:
         high_threshold = medium_threshold + 1.0
 
-    # Create supervised class labels from actual future outcomes
     train_df["risk_label"] = train_df["future_avg_7"].apply(
         lambda x: label_from_future(x, medium_threshold, high_threshold)
     )
@@ -222,13 +184,10 @@ def build_training_and_latest_frames(conn, table_name: str):
 
 
 # ============================================================
-# MODEL TRAINING + PREDICTION
+# MODEL TRAINING
 # ============================================================
 
 def train_hotspot_model(train_df: pd.DataFrame) -> RandomForestClassifier:
-    """
-    Train a Random Forest classifier on historical county snapshots.
-    """
     X = train_df[FEATURE_COLS].fillna(0)
     y = train_df["risk_label"]
 
@@ -246,9 +205,6 @@ def train_hotspot_model(train_df: pd.DataFrame) -> RandomForestClassifier:
 
 
 def make_reason(row):
-    """
-    Create a short human-readable explanation for the selected county.
-    """
     if row["predicted_risk"] == "High":
         return "High projected short-term case level with elevated recent activity."
     elif row["predicted_risk"] == "Medium":
@@ -256,14 +212,17 @@ def make_reason(row):
     return "Lower projected short-term case level with limited recent activity."
 
 
-def predict_current_hotspots(conn, table_name: str):
+# ============================================================
+# HOTSPOT PREDICTION
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def predict_current_hotspots(_conn, table_name: str):
     """
-    Full hotspot workflow:
-    - build training set from history
-    - train classifier
-    - predict current/latest county risk
+    Train the classifier and predict the latest risk for each county.
+    Cached so the hotspot page does not retrain on every rerun.
     """
-    train_df, latest_df = build_training_and_latest_frames(conn, table_name)
+    train_df, latest_df = build_training_and_latest_frames(_conn, table_name)
 
     if train_df.empty or latest_df.empty:
         return pd.DataFrame(), None
@@ -284,7 +243,6 @@ def predict_current_hotspots(conn, table_name: str):
     results["predicted_risk"] = predicted_labels
     results = pd.concat([results, prob_df], axis=1)
 
-    # Make sure all probability columns exist even if one class is missing
     if "prob_High" not in results.columns:
         results["prob_High"] = 0.0
     if "prob_Medium" not in results.columns:
@@ -292,7 +250,6 @@ def predict_current_hotspots(conn, table_name: str):
     if "prob_Low" not in results.columns:
         results["prob_Low"] = 0.0
 
-    # Confidence = highest class probability
     results["confidence"] = results.apply(
         lambda row: max(row["prob_High"], row["prob_Medium"], row["prob_Low"]),
         axis=1,
@@ -301,14 +258,12 @@ def predict_current_hotspots(conn, table_name: str):
     results["risk_rank"] = results["predicted_risk"].map(RISK_ORDER)
     results["reason"] = results.apply(make_reason, axis=1)
 
-    # Trend indicator from 7-day growth
     results["trend"] = np.where(
         results["growth_7"] > 0.10,
         "Rising",
         np.where(results["growth_7"] < -0.10, "Declining", "Stable"),
     )
 
-    # Sort to show highest-risk counties first
     results = results.sort_values(
         by=["risk_rank", "prob_High", "confidence", "avg_7day_cases", "growth_7"],
         ascending=[False, False, False, False, False],
@@ -326,13 +281,14 @@ def predict_current_hotspots(conn, table_name: str):
 
 
 # ============================================================
-# DETAIL VIEW SUPPORT
+# COUNTY HISTORY
 # ============================================================
 
-def get_county_history(conn, table_name: str, state: str, county: str) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def get_county_history(_conn, table_name: str, state: str, county: str) -> pd.DataFrame:
     """
-    Fetch full historical time series for one selected county.
-    Used for the detail chart on the Hotspot page.
+    Fetch full historical series for one county.
+    Used by both Hotspot and Prediction pages.
     """
     query = f"""
     SELECT date, cases, deaths, new_cases, new_deaths, ma7_new_cases
@@ -340,7 +296,7 @@ def get_county_history(conn, table_name: str, state: str, county: str) -> pd.Dat
     WHERE state = ? AND county = ?
     ORDER BY date
     """
-    history_df = read_sql(conn, query, (state, county))
+    history_df = read_sql(_conn, query, (state, county))
 
     if history_df.empty:
         return history_df
