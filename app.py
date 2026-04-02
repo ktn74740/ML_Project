@@ -44,7 +44,7 @@ elif page == "County Wise":
     render_county_analysis(conn, TABLE_NAME)
 
 elif page == "Hotspot":
-    hotspot_placeholder()
+    hotspot_placeholder(conn, TABLE_NAME)
 
 elif page == "Prediction":
     forecasting_placeholder()
