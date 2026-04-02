@@ -11,17 +11,18 @@ from forecasting import prepare_forecast_artifacts
 
 
 # ============================================================
-# MAP SUPPORT
+# SUPPORT: LOAD USA COUNTY MAP DATA
 # ============================================================
 
 @st.cache_data
+
 def load_us_counties_geojson():
     """
-    Load USA county boundary GeoJSON.
+    Load the GeoJSON file used to draw the USA county map.
 
-    SSL verification is bypassed here because some local Python
-    environments fail certificate verification while downloading
-    the file from GitHub.
+    We fetch the county boundary file from Plotly's public dataset source.
+    SSL verification is bypassed here because some local Python setups
+    fail certificate verification while downloading the file.
     """
     url = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
     ssl_context = ssl._create_unverified_context()
@@ -34,16 +35,20 @@ def load_us_counties_geojson():
 # HOTSPOT PAGE
 # ============================================================
 
+
 def hotspot_placeholder(conn, table_name):
     """
-    Hotspot page:
-    - summary cards
+    Render the Hotspot page.
+
+    This page shows:
+    - high-level hotspot summary metrics
     - top 10 risky counties
     - USA county risk map
-    - selected county detail view
+    - selected county details and trend chart
     """
     st.subheader("Hotspot Detection")
 
+    # Get the latest hotspot predictions and model metrics
     results, metrics = predict_current_hotspots(conn, table_name)
 
     if results.empty:
@@ -58,6 +63,8 @@ def hotspot_placeholder(conn, table_name):
     medium_count = int((results["predicted_risk"] == "Medium").sum())
     low_count = int((results["predicted_risk"] == "Low").sum())
 
+    # The first row is already the highest-risk county because the
+    # backend sorts the results in descending hotspot order.
     top_county = results.iloc[0]
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -67,6 +74,7 @@ def hotspot_placeholder(conn, table_name):
     c4.metric("Low Risk", f"{low_count:,}")
     c5.metric("Top Risk County", f"{top_county['county']}, {top_county['state']}")
 
+    # Show model metadata so it is easier to explain in presentation
     if metrics is not None:
         st.caption(
             f"Model: Random Forest Classifier | "
@@ -77,7 +85,7 @@ def hotspot_placeholder(conn, table_name):
     st.markdown("---")
 
     # --------------------------------------------------------
-    # Top 10 risky counties
+    # Top 10 risky counties table
     # --------------------------------------------------------
     st.markdown("### Top 10 Risky Counties")
 
@@ -95,6 +103,7 @@ def hotspot_placeholder(conn, table_name):
         ]
     ].copy()
 
+    # Format values for cleaner display
     top10["confidence"] = top10["confidence"].round(3)
     top10["avg_7day_cases"] = top10["avg_7day_cases"].round(1)
     top10["growth_7"] = (top10["growth_7"] * 100).round(2)
@@ -112,7 +121,7 @@ def hotspot_placeholder(conn, table_name):
     st.markdown("---")
 
     # --------------------------------------------------------
-    # USA risk map
+    # USA county-level risk map
     # --------------------------------------------------------
     st.markdown("### USA Risk Map")
 
@@ -121,7 +130,7 @@ def hotspot_placeholder(conn, table_name):
 
         map_df = results.copy()
 
-        # Keep only rows that have a valid county FIPS code
+        # Keep only valid 5-digit county FIPS values so Plotly can map them
         map_df = map_df[map_df["fips"].notna()].copy()
         map_df["fips"] = map_df["fips"].astype(str)
         map_df = map_df[map_df["fips"].str.len() == 5].copy()
@@ -169,10 +178,12 @@ def hotspot_placeholder(conn, table_name):
     st.markdown("---")
 
     # --------------------------------------------------------
-    # County detail section
+    # Selected county detail section
     # --------------------------------------------------------
     st.markdown("### County Details")
 
+    # We combine state + county in the display name because many
+    # counties share the same county name across different states.
     results["display_name"] = results["state"] + " — " + results["county"]
 
     selected_display = st.selectbox(
@@ -186,6 +197,7 @@ def hotspot_placeholder(conn, table_name):
     selected_state = selected_row["state"]
     selected_county = selected_row["county"]
 
+    # Show the selected county's key metrics
     cc1, cc2, cc3, cc4, cc5, cc6 = st.columns(6)
     cc1.metric("Risk Level", selected_row["predicted_risk"])
     cc2.metric("Confidence", f"{selected_row['confidence']:.2f}")
@@ -194,6 +206,7 @@ def hotspot_placeholder(conn, table_name):
     cc5.metric("Latest New Cases", f"{int(selected_row['new_cases']):,}")
     cc6.metric("7-Day Avg Cases", f"{selected_row['avg_7day_cases']:.1f}")
 
+    # Explain why the county was classified this way
     st.info(selected_row["reason"])
 
     st.markdown(
@@ -201,6 +214,7 @@ def hotspot_placeholder(conn, table_name):
         f"**7-Day Growth:** {selected_row['growth_7'] * 100:.2f}%"
     )
 
+    # Pull the selected county's full history for the line chart
     history = get_county_history(conn, table_name, selected_state, selected_county)
 
     if not history.empty:
@@ -231,21 +245,23 @@ def hotspot_placeholder(conn, table_name):
 
 
 # ============================================================
-# PREDICTION PAGE
+# FORECAST PAGE
 # ============================================================
+
 
 def forecasting_placeholder(conn, table_name):
     """
-    Prediction page:
-    - choose horizon
-    - select state and county
-    - show predicted value
-    - show validation metrics
-    - plot history + forecast
+    Render the Forecasting page.
+
+    This page allows the user to:
+    - choose a forecast horizon (1, 7, or 14 days)
+    - view top counties by predicted value
+    - select a state and county
+    - inspect forecast metrics and a forecast chart
     """
     st.subheader("Forecasting")
 
-    # User chooses prediction horizon
+    # Let the user choose forecast horizon
     horizon = st.radio(
         "Select Forecast Horizon",
         options=[1, 7, 14],
@@ -253,15 +269,68 @@ def forecasting_placeholder(conn, table_name):
         format_func=lambda x: f"{x}-Day",
     )
 
-    # Build forecast model + latest predictions
+    # Build or load the forecast model outputs for the chosen horizon
     model, latest_df, metrics = prepare_forecast_artifacts(conn, table_name, horizon)
 
     if latest_df.empty or model is None:
         st.warning("No forecast data available.")
         return
 
+    # Set labels based on the chosen forecast horizon
+    if horizon == 1:
+        forecast_label = "Next-Day Forecast"
+        forecast_desc = "Predicted new cases for the next day"
+        top_table_title = "Top 10 Counties by Next-Day Predicted Cases"
+    elif horizon == 7:
+        forecast_label = "Next 7-Day Avg Forecast"
+        forecast_desc = "Predicted average daily new cases over the next 7 days"
+        top_table_title = "Top 10 Counties by Next 7-Day Average Predicted Cases"
+    else:
+        forecast_label = "Next 14-Day Avg Forecast"
+        forecast_desc = "Predicted average daily new cases over the next 14 days"
+        top_table_title = "Top 10 Counties by Next 14-Day Average Predicted Cases"
+
+    st.info(forecast_desc)
+
     # --------------------------------------------------------
-    # State and county selection
+    # Top predicted counties table
+    # --------------------------------------------------------
+    st.markdown(f"### {top_table_title}")
+
+    top_pred = latest_df.copy()
+    top_pred = top_pred.sort_values("predicted_value", ascending=False).head(10).copy()
+    top_pred["predicted_value"] = top_pred["predicted_value"].round(1)
+    top_pred["avg_7day_cases"] = top_pred["avg_7day_cases"].round(1)
+    top_pred["growth_7"] = (top_pred["growth_7"] * 100).round(2)
+
+    top_pred.insert(0, "rank", range(1, len(top_pred) + 1))
+
+    st.dataframe(
+        top_pred[
+            [
+                "rank",
+                "state",
+                "county",
+                "predicted_value",
+                "new_cases",
+                "avg_7day_cases",
+                "growth_7",
+            ]
+        ].rename(
+            columns={
+                "predicted_value": forecast_label,
+                "new_cases": "latest_new_cases",
+                "avg_7day_cases": "current_7day_avg",
+                "growth_7": "growth_7_percent",
+            }
+        ),
+        use_container_width=True,
+    )
+
+    st.markdown("---")
+
+    # --------------------------------------------------------
+    # State and county selectors
     # --------------------------------------------------------
     states = sorted(latest_df["state"].dropna().unique().tolist())
 
@@ -285,31 +354,22 @@ def forecasting_placeholder(conn, table_name):
     )
 
     selected_row = latest_df[
-        (latest_df["state"] == selected_state) &
-        (latest_df["county"] == selected_county)
+        (latest_df["state"] == selected_state)
+        & (latest_df["county"] == selected_county)
     ].iloc[0]
 
     forecast_value = float(selected_row["predicted_value"])
 
     # --------------------------------------------------------
-    # Summary section
+    # Forecast metrics for the selected county
     # --------------------------------------------------------
-    if horizon == 1:
-        forecast_label = "Next-Day Forecast"
-        forecast_desc = "Predicted new cases for the next day"
-    elif horizon == 7:
-        forecast_label = "Next 7-Day Avg Forecast"
-        forecast_desc = "Predicted average daily new cases over the next 7 days"
-    else:
-        forecast_label = "Next 14-Day Avg Forecast"
-        forecast_desc = "Predicted average daily new cases over the next 14 days"
-
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(forecast_label, f"{forecast_value:,.1f}")
     c2.metric("Latest New Cases", f"{float(selected_row['new_cases']):,.0f}")
     c3.metric("Current 7-Day Avg", f"{float(selected_row['avg_7day_cases']):,.1f}")
     c4.metric("7-Day Growth", f"{float(selected_row['growth_7']) * 100:,.2f}%")
 
+    # Show model quality metrics so the prediction page is easier to explain
     if metrics is not None:
         st.caption(
             f"Model: Random Forest Regressor | "
@@ -320,19 +380,17 @@ def forecasting_placeholder(conn, table_name):
             f"R²: {metrics['r2']:.3f}"
         )
 
-    st.info(forecast_desc)
-
     st.markdown("---")
+    st.markdown("### County Forecast View")
 
-    # --------------------------------------------------------
-    # Historical + forecast chart
-    # --------------------------------------------------------
+    # Pull the selected county's full historical data
     history = get_county_history(conn, table_name, selected_state, selected_county)
 
     if history.empty:
         st.warning("No historical data found for this county.")
         return
 
+    # Build the history lines: daily cases + 7-day moving average
     history_plot = history[["date", "new_cases", "ma7_new_cases"]].copy()
     history_plot = history_plot.melt(
         id_vars="date",
@@ -350,6 +408,7 @@ def forecasting_placeholder(conn, table_name):
 
     last_date = history["date"].max()
 
+    # Create the future forecast line/point depending on horizon
     if horizon == 1:
         future_dates = [last_date + pd.Timedelta(days=1)]
         future_metric_name = "Forecasted Next-Day Cases"
@@ -361,11 +420,13 @@ def forecasting_placeholder(conn, table_name):
         )
         future_metric_name = f"Forecasted Daily Avg ({horizon}-Day Horizon)"
 
-    forecast_plot = pd.DataFrame({
-        "date": future_dates,
-        "metric": future_metric_name,
-        "count": forecast_value,
-    })
+    forecast_plot = pd.DataFrame(
+        {
+            "date": future_dates,
+            "metric": future_metric_name,
+            "count": forecast_value,
+        }
+    )
 
     combined_plot = pd.concat([history_plot, forecast_plot], ignore_index=True)
 
@@ -379,8 +440,12 @@ def forecasting_placeholder(conn, table_name):
 
     st.plotly_chart(fig_forecast, use_container_width=True)
 
-    if horizon in [7, 14]:
+    # Add a short explanation so users understand what the forecast line means
+    if horizon == 1:
         st.caption(
-            f"For the {horizon}-day horizon, the forecast line represents the "
-            f"predicted average daily new cases during that upcoming period."
+            "The forecast point shows the predicted number of new cases for the next day."
+        )
+    else:
+        st.caption(
+            f"The forecast line shows the predicted average daily new cases during the upcoming {horizon}-day period."
         )

@@ -1,5 +1,5 @@
 import streamlit as st
-
+from chatbot import render_chatbot
 from db import connect_db, table_exists
 from visuals import render_home, render_county_analysis
 from ml_model import hotspot_placeholder, forecasting_placeholder
@@ -19,7 +19,7 @@ st.title(APP_TITLE)
 # ----------------------------
 page = st.sidebar.radio(
     "Menu",
-    ["Home", "County Wise", "Hotspot", "Prediction"]
+    ["Home", "County Wise", "Hotspot", "Prediction", "Chatbot"]
 )
 
 # ----------------------------
@@ -48,3 +48,6 @@ elif page == "Hotspot":
 
 elif page == "Prediction":
     forecasting_placeholder(conn, TABLE_NAME)
+
+elif page == "Chatbot":
+    render_chatbot(conn, TABLE_NAME)
